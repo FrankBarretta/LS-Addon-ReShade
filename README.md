@@ -1,13 +1,31 @@
-# LS-Addon-ReShade
+# LS ReShade
 
-This is an addon for **LS Addons Manager (LosslessProxy)** designed to improve interaction with overlays like ReShade by managing input passthrough and cursor visibility.
+**LS ReShade** is an addon for **Lossless Scaling** that allows users to **use ReShade directly on the Lossless Scaling overlay**.
 
-## Features
+After starting the addon, the user can press a **custom key selected from the addon’s menu**.
+Once the key is pressed:
 
-*   **Input Passthrough**: Manages the passing of mouse and keyboard inputs to the game window or the overlay.
-*   **Cursor Management**: Forces cursor visibility when passthrough is active, ensuring it is always visible when needed.
-*   **Configurable Hotkey**: Hotkey (Default: `F9`) to toggle features on the fly.
-*   **ImGui Interface**: Integrated configuration panel to modify settings in real-time.
+* the **ReShade interface opens on top of the Lossless Scaling overlay**
+* the user can **fully interact with ReShade using keyboard and mouse**
+
+After closing the ReShade menu, the user can **press the same selected key again** to return to normal gameplay with the Lossless Scaling overlay active.
+
+This addon makes it possible to apply ReShade effects to the Lossless Scaling overlay itself, enabling advanced post-processing and visual customization.
+
+---
+
+## Known Issue
+
+There is a **known bug** that I am aware of and still need to fix:
+
+* After pressing the user-defined key (or key combination), the user must **click once with the mouse on the game or window being used** before being able to:
+
+  * play the game, or
+  * interact with ReShade.
+
+A **single mouse click** on the game/window is sufficient.
+
+I will try to fix this behavior in the future, although it is **not a high priority** at the moment.
 
 ---
 
@@ -17,10 +35,47 @@ This is an addon for **LS Addons Manager (LosslessProxy)** designed to improve i
 
 ## Installation
 
-1.  Ensure you have **LS Addons Manager (LosslessProxy)** installed.
-2.  Download the latest release of `LS_ReShade.dll`.
-3.  Copy the `LS_ReShade.dll` file into the `addons` folder of your Lossless Scaling installation.
-4.  Start Lossless Scaling.
+To use this addon, you must **first install the LS Addon Manager (LosslessProxy)**.
+
+### 1. Install LS Addon Manager
+
+Download the latest release of **LS Addon Manager (LosslessProxy)** from:
+👉 [https://github.com/FrankBarretta/LS-Addons-Manager](https://github.com/FrankBarretta/LS-Addons-Manager)
+
+Follow the instructions provided in the repository to complete the installation.
+
+---
+
+### 2. Install LS ReShade
+
+1. Download **`LS_ReShade.dll`** from the addon project’s release page.
+2. Go to the **main Lossless Scaling installation folder**.
+3. Create a folder named:
+
+   ```
+   addons
+   ```
+4. Inside the `addons` folder, create another folder named:
+
+   ```
+   LS_ReShade
+   ```
+5. Place the downloaded **`LS_ReShade.dll`** file inside the `LS_ReShade` folder.
+
+The final folder structure should look like this:
+
+```
+Lossless Scaling/
+└── addons/
+    └── LS_ReShade/
+        └── LS_ReShade.dll
+```
+
+---
+
+✅ **Done!**
+The addon is now installed and ready to be used with Lossless Scaling.
+
 
 ## Build
 
