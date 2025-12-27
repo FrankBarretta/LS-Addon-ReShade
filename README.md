@@ -46,3 +46,32 @@ Once the addon is loaded, you can access settings via the LosslessProxy/ImGui in
 *   Enable/Disable Input Passthrough.
 *   Hotkey Key (Virtual Key).
 *   Hotkey Modifiers (Ctrl, Alt, Shift).
+
+
+## ⚠️ Disclaimer
+
+This add-on is an unofficial extension for Lossless Scaling.
+
+It is NOT affiliated with, endorsed by, or supported by
+Lossless Scaling Developers in any way.
+
+This add-on was developed through independent analysis and
+reverse engineering of the software behavior. No proprietary
+source code or assets are included.
+
+Use at your own risk.
+
+The author assumes no responsibility for any damage, data loss,
+account bans, or other consequences resulting from the use of
+this add-on.
+
+This add-on may interact with the software at runtime in
+non-documented ways.
+
+
+## Legal Notice / Trademarks
+
+All trademarks, product names, and company names are the property
+of their respective owners and are used for identification purposes only.
+
+
