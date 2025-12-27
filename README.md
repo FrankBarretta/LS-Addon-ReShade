@@ -19,8 +19,8 @@ This is an addon for **LS Addons Manager (LosslessProxy)** designed to improve i
 
 1.  Ensure you have **LS Addons Manager (LosslessProxy)** installed.
 2.  Download the latest release of `LS_ReShade.dll`.
-3.  Copy the `LS_ReShade.dll` file into the `addons` folder of your LosslessProxy installation.
-4.  Start LosslessProxy.
+3.  Copy the `LS_ReShade.dll` file into the `addons` folder of your Lossless Scaling installation.
+4.  Start Lossless Scaling.
 
 ## Build
 
