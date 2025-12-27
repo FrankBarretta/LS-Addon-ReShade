@@ -9,6 +9,12 @@ This is an addon for **LS Addons Manager (LosslessProxy)** designed to improve i
 *   **Configurable Hotkey**: Hotkey (Default: `F9`) to toggle features on the fly.
 *   **ImGui Interface**: Integrated configuration panel to modify settings in real-time.
 
+---
+
+<img width="2165" height="1371" alt="Screenshot 2025-12-27 233804" src="https://github.com/user-attachments/assets/db37a1b0-8ac8-4ac0-a300-00941d460b21" />
+
+---
+
 ## Installation
 
 1.  Ensure you have **LS Addons Manager (LosslessProxy)** installed.
