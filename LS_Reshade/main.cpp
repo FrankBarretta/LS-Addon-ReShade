@@ -1,4 +1,4 @@
-#include "../../LosslessProxy/src/addon_api.hpp"
+#include "../../../LosslessProxy/src/addon_api.hpp"
 #include "logger.hpp"
 #include <windows.h>
 #include <thread>

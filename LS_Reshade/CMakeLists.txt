@@ -43,13 +43,13 @@ target_link_libraries(LS_ReShade
 
 # Set output directory
 set_target_properties(LS_ReShade PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../addons/LS_ReShade"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/../addons/LS_ReShade"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/LS_ReShade"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/LS_ReShade"
 )
 
 # Copy to addons directory after build
 add_custom_command(TARGET LS_ReShade POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/../../addons/LS_ReShade"
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:LS_ReShade> "${CMAKE_SOURCE_DIR}/../../addons/LS_ReShade/"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_SOURCE_DIR}/../"
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:LS_ReShade> "${CMAKE_SOURCE_DIR}/../"
     COMMENT "Copying LS_ReShade.dll to addons directory"
 )
