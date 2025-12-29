@@ -2,30 +2,20 @@
 
 **LS ReShade** is an addon for **Lossless Scaling** that allows users to **use ReShade directly on the Lossless Scaling overlay**.
 
-After starting the addon, the user can press a **custom key selected from the addon’s menu**.
-Once the key is pressed:
+After launching the addon, the user can press a **custom hotkey**, configurable from the addon’s menu.
+When the hotkey is pressed:
 
 * the **ReShade interface opens on top of the Lossless Scaling overlay**
-* the user can **fully interact with ReShade using keyboard and mouse**
+* the user can **fully interact with ReShade using both keyboard and mouse**
 
-After closing the ReShade menu, the user can **press the same selected key again** to return to normal gameplay with the Lossless Scaling overlay active.
+Once the ReShade menu is closed, the same hotkey can be **pressed again to return to normal gameplay**, with the Lossless Scaling overlay still active.
 
-This addon makes it possible to apply ReShade effects to the Lossless Scaling overlay itself, enabling advanced post-processing and visual customization.
+This addon makes it possible to apply **ReShade effects directly to the Lossless Scaling overlay itself**, enabling advanced post-processing and extensive visual customization.
 
----
+### Important note
 
-## Known Issue
-
-There is a **known bug** that I am aware of and still need to fix:
-
-* After pressing the user-defined key (or key combination), the user must **click once with the mouse on the game or window being used** before being able to:
-
-  * play the game, or
-  * interact with ReShade.
-
-A **single mouse click** on the game/window is sufficient.
-
-I will try to fix this behavior in the future, although it is **not a high priority** at the moment.
+**LS ReShade does not install or include ReShade.**
+Users must **download and install ReShade separately** and configure it for **Lossless Scaling (DirectX 11)** before using this addon.
 
 ---
 
