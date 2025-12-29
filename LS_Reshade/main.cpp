@@ -7,6 +7,7 @@
 
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include "imgui.h"
 
@@ -25,10 +26,12 @@ std::mutex g_StylesMutex;
 
 // Settings - controlled by ImGui
 std::atomic<bool> g_EnableInputPassthrough = false;  // Default: enabled
-std::atomic<int> g_HotkeyVirtualKey = VK_F9;  // Default: F9 key
+std::atomic<int> g_HotkeyVirtualKey = VK_HOME;  // Default: F9 key
 std::atomic<bool> g_HotkeyCtrl = false;
 std::atomic<bool> g_HotkeyAlt = false;
 std::atomic<bool> g_HotkeyShift = false;
+std::atomic<bool> g_EnableAutoClickAndRepress = true;
+std::atomic<bool> g_IsSimulatingInput = false;
 ImGuiContext* g_ImGuiContext = nullptr;
 
 // Hotkey state tracking
@@ -277,6 +280,93 @@ bool CheckHotkey() {
     return keyPressed && ctrlMatch && altMatch && shiftMatch;
 }
 
+void SimulateMouseClick() {
+    INPUT input = { 0 };
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    SendInput(1, &input, sizeof(INPUT));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(1, &input, sizeof(INPUT));
+}
+
+void SimulateKeyPress(int vk, bool ctrl, bool alt, bool shift) {
+    // Part 1: Press keys down
+    std::vector<INPUT> inputsDown;
+
+    // Modifiers down
+    if (ctrl) {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_CONTROL;
+        inputsDown.push_back(input);
+    }
+    if (alt) {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_MENU;
+        inputsDown.push_back(input);
+    }
+    if (shift) {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_SHIFT;
+        inputsDown.push_back(input);
+    }
+
+    // Key down
+    {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = vk;
+        inputsDown.push_back(input);
+    }
+
+    SendInput(static_cast<UINT>(inputsDown.size()), inputsDown.data(), sizeof(INPUT));
+
+    // Hold key to ensure it's detected by the loop (which might be sleeping for 100ms)
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // Part 2: Release keys
+    std::vector<INPUT> inputsUp;
+
+    // Key up
+    {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = vk;
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        inputsUp.push_back(input);
+    }
+
+    // Modifiers up
+    if (shift) {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_SHIFT;
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        inputsUp.push_back(input);
+    }
+    if (alt) {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_MENU;
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        inputsUp.push_back(input);
+    }
+    if (ctrl) {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_CONTROL;
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        inputsUp.push_back(input);
+    }
+
+    SendInput(static_cast<UINT>(inputsUp.size()), inputsUp.data(), sizeof(INPUT));
+}
+
 void InputBlockerLoop() {
     Log("InputBlocker thread started (persistent)");
     int cleanupCounter = 0;
@@ -287,9 +377,56 @@ void InputBlockerLoop() {
         bool hotkeyPressed = CheckHotkey();
         if (hotkeyPressed && !g_LastHotkeyState) {
             // Hotkey just pressed (rising edge)
-            bool newState = !g_EnableInputPassthrough.load();
-            g_EnableInputPassthrough = newState;
-            Log("Hotkey pressed - Input passthrough %s", newState ? "ENABLED" : "DISABLED");
+            
+            if (g_IsSimulatingInput.load()) {
+                Log("Ignored simulated hotkey press");
+            } else {
+                bool newState = !g_EnableInputPassthrough.load();
+                g_EnableInputPassthrough = newState;
+                Log("Hotkey pressed - Input passthrough %s", newState ? "ENABLED" : "DISABLED");
+
+                if (g_EnableAutoClickAndRepress.load()) {
+                     int vk = g_HotkeyVirtualKey.load();
+                     bool ctrl = g_HotkeyCtrl.load();
+                     bool alt = g_HotkeyAlt.load();
+                     bool shift = g_HotkeyShift.load();
+
+                     if (newState) {
+                         // Case: OFF -> ON
+                         // "clicca in automatico sull'overlay e subito dopo ripreme in automatico il tasto scelto"
+                         std::thread([vk, ctrl, alt, shift]() {
+                             g_IsSimulatingInput = true;
+                             std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                             
+                             SimulateMouseClick();
+                             
+                             std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+                             SimulateKeyPress(vk, ctrl, alt, shift);
+                             
+                             std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                             g_IsSimulatingInput = false;
+                         }).detach();
+                     } else {
+                         // Case: ON -> OFF
+                         // "ripreme in automatico il tasto scelto e subito dopo clicca in automatico sull'overlay"
+                         std::thread([vk, ctrl, alt, shift]() {
+                             g_IsSimulatingInput = true;
+                             //std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                             
+                             //SimulateKeyPress(vk, ctrl, alt, shift);
+
+                             std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                             g_IsSimulatingInput = false;
+
+                             std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+                             SimulateMouseClick();
+                             
+                         }).detach();
+                     }
+                }
+            }
         }
         g_LastHotkeyState = hotkeyPressed;
 
@@ -475,6 +612,12 @@ extern "C" __declspec(dllexport) void AddonRenderSettings() {
     if (ImGui::Checkbox("Enable Input Passthrough to Overlay", &enabled)) {
         g_EnableInputPassthrough = enabled;
         Log("Input passthrough %s via settings UI", enabled ? "ENABLED" : "DISABLED");
+    }
+
+    bool autoClick = g_EnableAutoClickAndRepress.load();
+    if (ImGui::Checkbox("Enable Auto Click & Repress (ReShade Fix)", &autoClick)) {
+        g_EnableAutoClickAndRepress = autoClick;
+        Log("Auto Click & Repress: %s", autoClick ? "ENABLED" : "DISABLED");
     }
 
     ImGui::Spacing();
