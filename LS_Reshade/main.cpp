@@ -32,6 +32,7 @@ std::atomic<bool> g_HotkeyAlt = false;
 std::atomic<bool> g_HotkeyShift = false;
 std::atomic<bool> g_EnableAutoClickAndRepress = true;
 std::atomic<bool> g_IsSimulatingInput = false;
+std::atomic<bool> g_WasEnabledViaUI = false;
 ImGuiContext* g_ImGuiContext = nullptr;
 
 // Hotkey state tracking
@@ -380,9 +381,16 @@ void InputBlockerLoop() {
             
             if (g_IsSimulatingInput.load()) {
                 Log("Ignored simulated hotkey press");
+            } else if (g_EnableInputPassthrough.load() && g_WasEnabledViaUI.load()) {
+                Log("Hotkey pressed after UI enable - Ignoring action to sync state");
+                g_WasEnabledViaUI = false;
             } else {
                 bool newState = !g_EnableInputPassthrough.load();
                 g_EnableInputPassthrough = newState;
+                if (newState) {
+                    g_WasEnabledViaUI = false;
+                }
+
                 Log("Hotkey pressed - Input passthrough %s", newState ? "ENABLED" : "DISABLED");
 
                 if (g_EnableAutoClickAndRepress.load()) {
@@ -412,9 +420,6 @@ void InputBlockerLoop() {
                          // "ripreme in automatico il tasto scelto e subito dopo clicca in automatico sull'overlay"
                          std::thread([vk, ctrl, alt, shift]() {
                              g_IsSimulatingInput = true;
-                             //std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                             
-                             //SimulateKeyPress(vk, ctrl, alt, shift);
 
                              std::this_thread::sleep_for(std::chrono::milliseconds(200));
                              g_IsSimulatingInput = false;
@@ -611,6 +616,11 @@ extern "C" __declspec(dllexport) void AddonRenderSettings() {
     bool enabled = g_EnableInputPassthrough.load();
     if (ImGui::Checkbox("Enable Input Passthrough to Overlay", &enabled)) {
         g_EnableInputPassthrough = enabled;
+        if (enabled) {
+            g_WasEnabledViaUI = true;
+        } else {
+            g_WasEnabledViaUI = false;
+        }
         Log("Input passthrough %s via settings UI", enabled ? "ENABLED" : "DISABLED");
     }
 
