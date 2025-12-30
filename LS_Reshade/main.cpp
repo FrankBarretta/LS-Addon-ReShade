@@ -8,6 +8,7 @@
 #include <map>
 #include <vector>
 #include <string>
+#include <cstring>
 #include <functional>
 
 // --- Global Settings ---
@@ -226,6 +227,41 @@ public:
 std::map<HWND, WindowManager::WindowState> WindowManager::windows;
 std::mutex WindowManager::mutex;
 
+// --- Helper Functions for Window Detection ---
+HWND GetLSWindow() {
+    HWND hFound = nullptr;
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        DWORD pid;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd)) {
+            *(HWND*)lParam = hwnd;
+            return FALSE; 
+        }
+        return TRUE;
+    }, (LPARAM)&hFound);
+    return hFound;
+}
+
+HWND GetTargetWindow(HWND hLS) {
+    if (!hLS) return nullptr;
+    HWND hCurr = GetWindow(hLS, GW_HWNDNEXT);
+    while (hCurr) {
+        if (IsWindowVisible(hCurr)) {
+            DWORD pid;
+            GetWindowThreadProcessId(hCurr, &pid);
+            if (pid != GetCurrentProcessId()) {
+                char className[256];
+                GetClassNameA(hCurr, className, sizeof(className));
+                if (strcmp(className, "Progman") != 0 && strcmp(className, "Shell_TrayWnd") != 0 && strcmp(className, "WorkerW") != 0) {
+                     return hCurr;
+                }
+            }
+        }
+        hCurr = GetWindow(hCurr, GW_HWNDNEXT);
+    }
+    return nullptr;
+}
+
 // --- Main Logic ---
 
 void WorkerThread() {
@@ -252,36 +288,55 @@ void WorkerThread() {
 
         // 2. Handle Toggle
         if (hotkeyPressed && !lastHotkeyState && !g_Settings.isSimulating) {
-            bool newState = !g_Settings.inputPassthrough;
-            g_Settings.inputPassthrough = newState;
-            Log("Passthrough toggled: %s", newState ? "ON" : "OFF");
+            HWND hForeground = GetForegroundWindow();
+            DWORD forePid = 0;
+            GetWindowThreadProcessId(hForeground, &forePid);
 
-            if (!newState) {
-                WindowManager::RestoreAll();
+            bool allowToggle = false;
+            if (forePid == GetCurrentProcessId()) {
+                allowToggle = true;
+            } else {
+                HWND hLS = GetLSWindow();
+                if (hLS) {
+                    HWND hTarget = GetTargetWindow(hLS);
+                    if (hForeground == hTarget) {
+                        allowToggle = true;
+                    }
+                }
             }
 
-            // Auto Click & Repress Logic
-            if (g_Settings.autoClickRepress) {
-                std::thread([newState]() {
-                    g_Settings.isSimulating = true;
-                    int vk = g_Settings.hotkeyVk;
-                    bool c = g_Settings.hotkeyCtrl;
-                    bool a = g_Settings.hotkeyAlt;
-                    bool s = g_Settings.hotkeyShift;
+            if (allowToggle) {
+                bool newState = !g_Settings.inputPassthrough;
+                g_Settings.inputPassthrough = newState;
+                Log("Passthrough toggled: %s", newState ? "ON" : "OFF");
 
-                    if (newState) { // ON
-                        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                        InputSim::Click();
+                if (!newState) {
+                    WindowManager::RestoreAll();
+                }
+
+                // Auto Click & Repress Logic
+                if (g_Settings.autoClickRepress) {
+                    std::thread([newState]() {
+                        g_Settings.isSimulating = true;
+                        int vk = g_Settings.hotkeyVk;
+                        bool c = g_Settings.hotkeyCtrl;
+                        bool a = g_Settings.hotkeyAlt;
+                        bool s = g_Settings.hotkeyShift;
+
+                        if (newState) { // ON
+                            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                            InputSim::Click();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                            InputSim::PressCombo(vk, c, a, s);
+                        } else { // OFF
+                            std::this_thread::sleep_for(std::chrono::milliseconds(450));
+                            InputSim::Click();
+                        }
+                        
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                        InputSim::PressCombo(vk, c, a, s);
-                    } else { // OFF
-                        std::this_thread::sleep_for(std::chrono::milliseconds(450));
-                        InputSim::Click();
-                    }
-                    
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    g_Settings.isSimulating = false;
-                }).detach();
+                        g_Settings.isSimulating = false;
+                    }).detach();
+                }
             }
         }
         lastHotkeyState = hotkeyPressed;
