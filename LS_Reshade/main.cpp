@@ -270,6 +270,32 @@ void WorkerThread() {
     int cleanupCounter = 0;
 
     while (g_Settings.threadRunning) {
+        // 0. Auto-disable on focus loss
+        if (g_Settings.inputPassthrough) {
+            HWND hForeground = GetForegroundWindow();
+            DWORD forePid = 0;
+            GetWindowThreadProcessId(hForeground, &forePid);
+
+            bool validFocus = false;
+            if (forePid == GetCurrentProcessId()) {
+                validFocus = true;
+            } else {
+                HWND hLS = GetLSWindow();
+                if (hLS) {
+                    HWND hTarget = GetTargetWindow(hLS);
+                    if (hForeground == hTarget) {
+                        validFocus = true;
+                    }
+                }
+            }
+
+            if (!validFocus) {
+                g_Settings.inputPassthrough = false;
+                Log("Passthrough disabled: Focus lost");
+                WindowManager::RestoreAll();
+            }
+        }
+
         // 1. Check Hotkey
         bool hotkeyPressed = false;
         if (g_Settings.hotkeyVk != 0) {
