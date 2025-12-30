@@ -438,11 +438,11 @@ extern "C" __declspec(dllexport) void AddonRenderSettings() {
     ImGui::TextWrapped("Input Blocker allows interaction with the overlay.");
     ImGui::Separator();
 
-    bool enabled = g_Settings.inputPassthrough;
-    if (ImGui::Checkbox("Enable Input Passthrough", &enabled)) {
-        g_Settings.inputPassthrough = enabled;
-        if (!enabled) WindowManager::RestoreAll();
-    }
+    // bool enabled = g_Settings.inputPassthrough;
+    // if (ImGui::Checkbox("Enable Input Passthrough", &enabled)) {
+    //     g_Settings.inputPassthrough = enabled;
+    //     if (!enabled) WindowManager::RestoreAll();
+    // }
 
     bool autoClick = g_Settings.autoClickRepress;
     if (ImGui::Checkbox("Enable Auto Click & Repress", &autoClick)) g_Settings.autoClickRepress = autoClick;
