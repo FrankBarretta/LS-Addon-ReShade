@@ -400,6 +400,34 @@ void WorkerThread() {
     Log("Worker thread stopped");
 }
 
+// --- Config Helper ---
+
+extern "C" __declspec(dllexport) void AddonInitialize(IHost* host, ImGuiContext* ctx, void* alloc_func, void* free_func, void* user_data);
+
+void LoadSettings(const std::wstring& path) {
+    g_Settings.hotkeyVk = GetPrivateProfileIntW(L"Settings", L"HotkeyVk", VK_HOME, path.c_str());
+    g_Settings.hotkeyCtrl = GetPrivateProfileIntW(L"Settings", L"HotkeyCtrl", 0, path.c_str());
+    g_Settings.hotkeyAlt = GetPrivateProfileIntW(L"Settings", L"HotkeyAlt", 0, path.c_str());
+    g_Settings.hotkeyShift = GetPrivateProfileIntW(L"Settings", L"HotkeyShift", 0, path.c_str());
+    g_Settings.autoClickRepress = GetPrivateProfileIntW(L"Settings", L"AutoClickRepress", 1, path.c_str());
+}
+
+void SaveSettings() {
+    HMODULE hModule = NULL;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&AddonInitialize, &hModule);
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(hModule, path, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(path, L'\\');
+    if (lastSlash) *(lastSlash + 1) = L'\0';
+    std::wstring configPath = std::wstring(path) + L"config.ini";
+
+    WritePrivateProfileStringW(L"Settings", L"HotkeyVk", std::to_wstring(g_Settings.hotkeyVk.load()).c_str(), configPath.c_str());
+    WritePrivateProfileStringW(L"Settings", L"HotkeyCtrl", std::to_wstring(g_Settings.hotkeyCtrl.load()).c_str(), configPath.c_str());
+    WritePrivateProfileStringW(L"Settings", L"HotkeyAlt", std::to_wstring(g_Settings.hotkeyAlt.load()).c_str(), configPath.c_str());
+    WritePrivateProfileStringW(L"Settings", L"HotkeyShift", std::to_wstring(g_Settings.hotkeyShift.load()).c_str(), configPath.c_str());
+    WritePrivateProfileStringW(L"Settings", L"AutoClickRepress", std::to_wstring(g_Settings.autoClickRepress.load()).c_str(), configPath.c_str());
+}
+
 // --- Exports ---
 
 extern "C" __declspec(dllexport) void AddonInitialize(IHost* host, ImGuiContext* ctx, void* alloc_func, void* free_func, void* user_data) {
@@ -412,6 +440,8 @@ extern "C" __declspec(dllexport) void AddonInitialize(IHost* host, ImGuiContext*
     if (lastSlash) *(lastSlash + 1) = L'\0';
     Logger::Init(std::wstring(path) + L"LS_ReShade.log");
     
+    LoadSettings(std::wstring(path) + L"config.ini");
+
     Log("Addon Initialized");
     g_ImGuiContext = ctx;
 
@@ -471,7 +501,10 @@ extern "C" __declspec(dllexport) void AddonRenderSettings() {
     // }
 
     bool autoClick = g_Settings.autoClickRepress;
-    if (ImGui::Checkbox("Enable Auto Click & Repress", &autoClick)) g_Settings.autoClickRepress = autoClick;
+    if (ImGui::Checkbox("Enable Auto Click & Repress", &autoClick)) {
+        g_Settings.autoClickRepress = autoClick;
+        SaveSettings();
+    }
 
     ImGui::Separator();
     ImGui::Text("Hotkey:");
@@ -479,18 +512,24 @@ extern "C" __declspec(dllexport) void AddonRenderSettings() {
     bool c = g_Settings.hotkeyCtrl;
     bool a = g_Settings.hotkeyAlt;
     bool s = g_Settings.hotkeyShift;
-    if (ImGui::Checkbox("Ctrl", &c)) g_Settings.hotkeyCtrl = c;
+    bool changed = false;
+    if (ImGui::Checkbox("Ctrl", &c)) { g_Settings.hotkeyCtrl = c; changed = true; }
     ImGui::SameLine();
-    if (ImGui::Checkbox("Alt", &a)) g_Settings.hotkeyAlt = a;
+    if (ImGui::Checkbox("Alt", &a)) { g_Settings.hotkeyAlt = a; changed = true; }
     ImGui::SameLine();
-    if (ImGui::Checkbox("Shift", &s)) g_Settings.hotkeyShift = s;
+    if (ImGui::Checkbox("Shift", &s)) { g_Settings.hotkeyShift = s; changed = true; }
 
     int currentKey = g_Settings.hotkeyVk;
     if (ImGui::BeginCombo("Key", GetKeyName(currentKey))) {
         const int keys[] = { 0, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z' };
         for (int vk : keys) {
-            if (ImGui::Selectable(GetKeyName(vk), currentKey == vk)) g_Settings.hotkeyVk = vk;
+            if (ImGui::Selectable(GetKeyName(vk), currentKey == vk)) {
+                g_Settings.hotkeyVk = vk;
+                changed = true;
+            }
         }
         ImGui::EndCombo();
     }
+
+    if (changed) SaveSettings();
 }
