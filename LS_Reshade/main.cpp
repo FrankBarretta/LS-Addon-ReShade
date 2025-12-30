@@ -1,706 +1,352 @@
 #include "../../../LosslessProxy/src/addon_api.hpp"
 #include "logger.hpp"
-#include <windows.h>
-#include <thread>
-#include <atomic>
-#include <chrono>
-
-#include <map>
-#include <mutex>
-#include <vector>
-
 #include "imgui.h"
+#include <windows.h>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <map>
+#include <vector>
+#include <string>
+#include <functional>
 
-std::atomic<bool> g_ThreadShouldExit = false;
-std::thread g_Thread;
-std::map<HWND, WNDPROC> g_SubclassedWindows;
-std::mutex g_SubclassMutex;
+// --- Global Settings ---
+struct Settings {
+    std::atomic<bool> threadRunning{ true };
+    std::atomic<bool> inputPassthrough{ false };
+    std::atomic<int> hotkeyVk{ VK_HOME };
+    std::atomic<bool> hotkeyCtrl{ false };
+    std::atomic<bool> hotkeyAlt{ false };
+    std::atomic<bool> hotkeyShift{ false };
+    std::atomic<bool> autoClickRepress{ true };
+    std::atomic<bool> isSimulating{ false };
+} g_Settings;
 
-// Store original window styles to restore on shutdown
-struct WindowStyles {
-    LONG_PTR exStyle;
-    LONG_PTR style;
-};
-std::map<HWND, WindowStyles> g_OriginalStyles;
-std::mutex g_StylesMutex;
-
-// Settings - controlled by ImGui
-std::atomic<bool> g_EnableInputPassthrough = false;  // Default: enabled
-std::atomic<int> g_HotkeyVirtualKey = VK_HOME;  // Default: F9 key
-std::atomic<bool> g_HotkeyCtrl = false;
-std::atomic<bool> g_HotkeyAlt = false;
-std::atomic<bool> g_HotkeyShift = false;
-std::atomic<bool> g_EnableAutoClickAndRepress = true;
-std::atomic<bool> g_IsSimulatingInput = false;
-std::atomic<bool> g_WasEnabledViaUI = false;
 ImGuiContext* g_ImGuiContext = nullptr;
 
-// Hotkey state tracking
-bool g_LastHotkeyState = false;
+// --- Input Simulation Helper ---
+namespace InputSim {
+    void SendKey(WORD vk, bool down) {
+        INPUT input = { 0 };
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = vk;
+        input.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+        SendInput(1, &input, sizeof(INPUT));
+    }
 
-LRESULT CALLBACK NewWndProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    // Handle cursor visibility FIRST, regardless of addon state
-    if (uMsg == WM_SETCURSOR || uMsg == WM_MOUSEMOVE) {
-        if (g_EnableInputPassthrough) {
-            // Only force cursor when passthrough is enabled
-            SetCursor(LoadCursor(NULL, IDC_ARROW));
+    void Click() {
+        INPUT input = { 0 };
+        input.type = INPUT_MOUSE;
+        input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+        SendInput(1, &input, sizeof(INPUT));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+        SendInput(1, &input, sizeof(INPUT));
+    }
 
-            CURSORINFO ci = { sizeof(CURSORINFO) };
-            if (GetCursorInfo(&ci)) {
-                if (!(ci.flags & CURSOR_SHOWING)) {
+    void PressCombo(int vk, bool ctrl, bool alt, bool shift) {
+        if (ctrl) SendKey(VK_CONTROL, true);
+        if (alt) SendKey(VK_MENU, true);
+        if (shift) SendKey(VK_SHIFT, true);
+
+        SendKey(vk, true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        SendKey(vk, false);
+
+        if (shift) SendKey(VK_SHIFT, false);
+        if (alt) SendKey(VK_MENU, false);
+        if (ctrl) SendKey(VK_CONTROL, false);
+    }
+}
+
+// --- Window Management Helper ---
+class WindowManager {
+    struct WindowState {
+        WNDPROC originalProc = nullptr;
+        LONG_PTR originalStyle = 0;
+        LONG_PTR originalExStyle = 0;
+        bool stylesModified = false;
+        bool activated = false;
+    };
+
+    static std::map<HWND, WindowState> windows;
+    static std::mutex mutex;
+
+    // Custom Window Procedure
+    static LRESULT CALLBACK HookProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+        // 1. Handle Cursor Visibility & Clipping (Priority)
+        if (g_Settings.inputPassthrough) {
+            if (uMsg == WM_SETCURSOR || uMsg == WM_MOUSEMOVE) {
+                SetCursor(LoadCursor(NULL, IDC_ARROW));
+                CURSORINFO ci = { sizeof(CURSORINFO) };
+                if (GetCursorInfo(&ci) && !(ci.flags & CURSOR_SHOWING)) {
                     while (ShowCursor(TRUE) < 0);
                 }
+                ClipCursor(NULL);
+                if (uMsg == WM_SETCURSOR) return TRUE;
             }
-
-            // Aggressively unclip cursor on every move to fight LS clipping
-            ClipCursor(NULL);
-
-            if (uMsg == WM_SETCURSOR) return TRUE; // Prevent default handling
         }
-    }
 
-    if (uMsg == WM_LBUTTONDOWN && g_EnableInputPassthrough) {
-        Log("WM_LBUTTONDOWN received on window %p", hwnd);
-    }
-
-    WNDPROC oldProc = NULL;
-    {
-        std::lock_guard<std::mutex> lock(g_SubclassMutex);
-        auto it = g_SubclassedWindows.find(hwnd);
-        if (it != g_SubclassedWindows.end()) {
-            oldProc = it->second;
+        // 2. Retrieve Original WndProc
+        WNDPROC oldProc = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto it = windows.find(hwnd);
+            if (it != windows.end()) oldProc = it->second.originalProc;
         }
-    }
 
-    // Critical fix: If we don't have oldProc in our map, this window wasn't subclassed yet
-    // This can happen briefly when a new window is created before our loop catches it
-    // In this case, read the CURRENT wndproc from the window (which might be LS's or another subclasser)
-    if (!oldProc) {
-        WNDPROC currentProc = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_WNDPROC);
-        // If the current proc is OUR proc, it means we're in a recursive call
-        // This shouldn't happen normally, but protect against infinite loop
-        if (currentProc != NewWndProc) {
-            oldProc = currentProc;
-            Log("NewWndProc called for unknown window %p, using current proc %p", hwnd, currentProc);
+        // Fallback if not found (shouldn't happen often)
+        if (!oldProc) {
+            oldProc = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_WNDPROC);
+            if (oldProc == HookProc) return DefWindowProc(hwnd, uMsg, wParam, lParam);
         }
-    }
 
-    if (oldProc) {
+        // 3. Call Original WndProc
         LRESULT ret = CallWindowProc(oldProc, hwnd, uMsg, wParam, lParam);
 
-        // Fix click-through ONLY when passthrough is enabled
-        if (g_EnableInputPassthrough && uMsg == WM_NCHITTEST && ret == HTTRANSPARENT) {
+        // 4. Fix Click-Through
+        if (g_Settings.inputPassthrough && uMsg == WM_NCHITTEST && ret == HTTRANSPARENT) {
             return HTCLIENT;
         }
+
         return ret;
     }
 
-    // Last resort fallback
-    return DefWindowProc(hwnd, uMsg, wParam, lParam);
-}
-
-void SubclassWindow(HWND hwnd) {
-    std::lock_guard<std::mutex> lock(g_SubclassMutex);
-
-    // Always get the current WNDPROC to ensure we have the latest one
-    WNDPROC currentProc = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_WNDPROC);
-
-    // If it's already our proc, check if we have it in our map
-    if (currentProc == NewWndProc) {
-        // Verify we have the original proc saved
-        auto it = g_SubclassedWindows.find(hwnd);
-        if (it != g_SubclassedWindows.end()) {
-            return; // Already subclassed and saved
-        } else {
-            // Our proc is installed but we don't have the original saved!
-            // This shouldn't happen, but log it
-            Log("WARNING: NewWndProc already installed on %p but not in map!", hwnd);
-            return; // Can't do anything about it
-        }
-    }
-
-    // Check if we already have this window in our map with a different proc
-    // This means the window's WNDPROC was changed by someone else after we subclassed it
-    auto it = g_SubclassedWindows.find(hwnd);
-    if (it != g_SubclassedWindows.end()) {
-        // Update the saved proc to the current one
-        Log("Window %p WNDPROC changed from %p to %p, updating", hwnd, it->second, currentProc);
-        it->second = currentProc;
-    }
-
-    // Install our proc and save the current one
-    WNDPROC oldProc = (WNDPROC)SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)NewWndProc);
-    if (oldProc && oldProc != NewWndProc) {
-        g_SubclassedWindows[hwnd] = oldProc;
-        Log("Subclassed window: %p (saved proc: %p)", hwnd, oldProc);
-    }
-}
-
-BOOL CALLBACK EnumChildWindowsProc(HWND hwnd, LPARAM lParam) {
-    SubclassWindow(hwnd);
-    return TRUE;
-}
-
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
-    DWORD pid;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == GetCurrentProcessId()) {
-        if (IsWindowVisible(hwnd)) {
-            LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-            LONG_PTR styleNormal = GetWindowLongPtr(hwnd, GWL_STYLE);
-
-            // Check if we need to save original styles
+public:
+    static void ProcessWindow(HWND hwnd) {
+        // 1. Subclassing
+        WNDPROC currentProc = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_WNDPROC);
+        if (currentProc != HookProc) {
             {
-                std::lock_guard<std::mutex> lock(g_StylesMutex);
-                if (g_OriginalStyles.find(hwnd) == g_OriginalStyles.end()) {
-                    // Save original styles on first encounter
-                    WindowStyles original;
-                    original.exStyle = exStyle;
-                    original.style = styleNormal;
-                    g_OriginalStyles[hwnd] = original;
-                    Log("Saved original styles for window %p: exStyle=%llx, style=%llx", hwnd, exStyle, styleNormal);
+                std::lock_guard<std::mutex> lock(mutex);
+                windows[hwnd].originalProc = currentProc;
+            }
+            SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)HookProc);
+        }
+
+        // 2. Style Modification
+        if (g_Settings.inputPassthrough) {
+            LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+            LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+
+            bool isNew = false;
+            bool isOverlay = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                WindowState& state = windows[hwnd];
+                if (!state.stylesModified) {
+                    state.originalExStyle = exStyle;
+                    state.originalStyle = style;
+                    state.stylesModified = true;
+                }
+                if (!state.activated) {
+                    isNew = true;
+                    state.activated = true;
+                }
+                isOverlay = (state.originalExStyle & (WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE)) != 0;
+            }
+
+            LONG_PTR newExStyle = exStyle & ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_LAYERED);
+            LONG_PTR newStyle = style & ~WS_DISABLED;
+
+            bool stylesChanged = (newExStyle != exStyle || newStyle != style);
+
+            if (stylesChanged) {
+                SetWindowLongPtr(hwnd, GWL_EXSTYLE, newExStyle);
+                SetWindowLongPtr(hwnd, GWL_STYLE, newStyle);
+            }
+
+            if (stylesChanged || isNew) {
+                if (isOverlay) {
+                    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+                    
+                    // Force Foreground
+                    DWORD foreThread = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
+                    DWORD curThread = GetCurrentThreadId();
+                    if (foreThread != curThread) {
+                        AttachThreadInput(foreThread, curThread, TRUE);
+                        BringWindowToTop(hwnd);
+                        SetForegroundWindow(hwnd);
+                        AttachThreadInput(foreThread, curThread, FALSE);
+                    } else {
+                        SetForegroundWindow(hwnd);
+                    }
+                } else if (stylesChanged) {
+                    SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_NOZORDER);
                 }
             }
-
-            LONG_PTR newExStyle = exStyle;
-            LONG_PTR newStyle = styleNormal;
-            bool needsStyleChange = false;
-
-            if (exStyle & WS_EX_TRANSPARENT) {
-                newExStyle &= ~WS_EX_TRANSPARENT;
-                needsStyleChange = true;
-            }
-
-            if (exStyle & WS_EX_NOACTIVATE) {
-                newExStyle &= ~WS_EX_NOACTIVATE;
-                needsStyleChange = true;
-            }
-
-            if (exStyle & WS_EX_LAYERED) {
-                newExStyle &= ~WS_EX_LAYERED;
-                needsStyleChange = true;
-            }
-
-            if (styleNormal & WS_DISABLED) {
-                newStyle &= ~WS_DISABLED;
-                needsStyleChange = true;
-            }
-
-            // Apply style changes if needed
-            if (needsStyleChange) {
-                char title[256];
-                GetWindowTextA(hwnd, title, sizeof(title));
-
-                if (newStyle != styleNormal) {
-                    SetWindowLongPtr(hwnd, GWL_STYLE, newStyle);
-                }
-                if (newExStyle != exStyle) {
-                    SetWindowLongPtr(hwnd, GWL_EXSTYLE, newExStyle);
-                }
-
-                // Force window update and Z-order to TOPMOST
-                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
-
-                // Try to bring to foreground to capture keyboard input
-                SetForegroundWindow(hwnd);
-                SetFocus(hwnd);
-            }
-
-            // ALWAYS subclass AFTER style changes
-            // This ensures the window can receive input after we modified its styles
-            SubclassWindow(hwnd);
-            EnumChildWindows(hwnd, EnumChildWindowsProc, 0);
         }
     }
-    return TRUE;
-}
 
-BOOL CALLBACK RestoreWindowStylesProc(HWND hwnd, LPARAM lParam) {
-    DWORD pid;
-    GetWindowThreadProcessId(hwnd, &pid);
-    if (pid == GetCurrentProcessId()) {
-        if (IsWindowVisible(hwnd)) {
-            std::lock_guard<std::mutex> lock(g_StylesMutex);
-            auto it = g_OriginalStyles.find(hwnd);
-            if (it != g_OriginalStyles.end()) {
-                // Restore original styles
-                const WindowStyles& original = it->second;
+    static void RestoreAll() {
+        std::vector<std::pair<HWND, WindowState>> toRestore;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            for (const auto& pair : windows) {
+                toRestore.push_back(pair);
+            }
+        }
 
-                LONG_PTR currentExStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-                LONG_PTR currentStyle = GetWindowLongPtr(hwnd, GWL_STYLE);
+        Log("Restoring %zu windows...", toRestore.size());
+        
+        for (const auto& item : toRestore) {
+            HWND hwnd = item.first;
+            const WindowState& state = item.second;
 
-                bool needsRestore = false;
+            if (!IsWindow(hwnd)) continue;
 
-                if (currentExStyle != original.exStyle) {
-                    SetWindowLongPtr(hwnd, GWL_EXSTYLE, original.exStyle);
-                    needsRestore = true;
-                }
-
-                if (currentStyle != original.style) {
-                    SetWindowLongPtr(hwnd, GWL_STYLE, original.style);
-                    needsRestore = true;
-                }
-
-                if (needsRestore) {
-                    // Force window update
-                    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-                    Log("Restored original styles for window %p", hwnd);
-                }
+            // Restore Styles
+            if (state.stylesModified) {
+                SetWindowLongPtr(hwnd, GWL_EXSTYLE, state.originalExStyle);
+                SetWindowLongPtr(hwnd, GWL_STYLE, state.originalStyle);
+                SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
             }
 
-            // Also restore child windows
-            EnumChildWindows(hwnd, RestoreWindowStylesProc, 0);
+            // Restore WndProc
+            if (GetWindowLongPtr(hwnd, GWLP_WNDPROC) == (LONG_PTR)HookProc) {
+                SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)state.originalProc);
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            windows.clear();
         }
     }
-    return TRUE;
-}
 
-void RestoreAllWindowStyles() {
-    Log("Restoring all window styles to original state");
-    EnumWindows(RestoreWindowStylesProc, 0);
-}
-
-bool CheckHotkey() {
-    int vk = g_HotkeyVirtualKey.load();
-    if (vk == 0) return false; // No hotkey set
-
-    // Check if the main key is pressed
-    bool keyPressed = (GetAsyncKeyState(vk) & 0x8000) != 0;
-
-    // Check modifiers
-    bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    bool altPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-    bool shiftPressed = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
-
-    // Check if all required modifiers match
-    bool ctrlMatch = g_HotkeyCtrl.load() == ctrlPressed;
-    bool altMatch = g_HotkeyAlt.load() == altPressed;
-    bool shiftMatch = g_HotkeyShift.load() == shiftPressed;
-
-    return keyPressed && ctrlMatch && altMatch && shiftMatch;
-}
-
-void SimulateMouseClick() {
-    INPUT input = { 0 };
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    SendInput(1, &input, sizeof(INPUT));
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    SendInput(1, &input, sizeof(INPUT));
-}
-
-void SimulateKeyPress(int vk, bool ctrl, bool alt, bool shift) {
-    // Part 1: Press keys down
-    std::vector<INPUT> inputsDown;
-
-    // Modifiers down
-    if (ctrl) {
-        INPUT input = { 0 };
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = VK_CONTROL;
-        inputsDown.push_back(input);
+    static void CleanupDeadWindows() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto it = windows.begin(); it != windows.end();) {
+            if (!IsWindow(it->first)) it = windows.erase(it);
+            else ++it;
+        }
     }
-    if (alt) {
-        INPUT input = { 0 };
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = VK_MENU;
-        inputsDown.push_back(input);
-    }
-    if (shift) {
-        INPUT input = { 0 };
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = VK_SHIFT;
-        inputsDown.push_back(input);
-    }
+};
 
-    // Key down
-    {
-        INPUT input = { 0 };
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = vk;
-        inputsDown.push_back(input);
-    }
+std::map<HWND, WindowManager::WindowState> WindowManager::windows;
+std::mutex WindowManager::mutex;
 
-    SendInput(static_cast<UINT>(inputsDown.size()), inputsDown.data(), sizeof(INPUT));
+// --- Main Logic ---
 
-    // Hold key to ensure it's detected by the loop (which might be sleeping for 100ms)
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-    // Part 2: Release keys
-    std::vector<INPUT> inputsUp;
-
-    // Key up
-    {
-        INPUT input = { 0 };
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = vk;
-        input.ki.dwFlags = KEYEVENTF_KEYUP;
-        inputsUp.push_back(input);
-    }
-
-    // Modifiers up
-    if (shift) {
-        INPUT input = { 0 };
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = VK_SHIFT;
-        input.ki.dwFlags = KEYEVENTF_KEYUP;
-        inputsUp.push_back(input);
-    }
-    if (alt) {
-        INPUT input = { 0 };
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = VK_MENU;
-        input.ki.dwFlags = KEYEVENTF_KEYUP;
-        inputsUp.push_back(input);
-    }
-    if (ctrl) {
-        INPUT input = { 0 };
-        input.type = INPUT_KEYBOARD;
-        input.ki.wVk = VK_CONTROL;
-        input.ki.dwFlags = KEYEVENTF_KEYUP;
-        inputsUp.push_back(input);
-    }
-
-    SendInput(static_cast<UINT>(inputsUp.size()), inputsUp.data(), sizeof(INPUT));
-}
-
-void InputBlockerLoop() {
-    Log("InputBlocker thread started (persistent)");
+void WorkerThread() {
+    Log("Worker thread started");
+    bool lastHotkeyState = false;
     int cleanupCounter = 0;
-    bool previousPassthroughState = g_EnableInputPassthrough.load();
 
-    while (!g_ThreadShouldExit) {
-        // Check hotkey (works whether passthrough is enabled or not)
-        bool hotkeyPressed = CheckHotkey();
-        if (hotkeyPressed && !g_LastHotkeyState) {
-            // Hotkey just pressed (rising edge)
+    while (g_Settings.threadRunning) {
+        // 1. Check Hotkey
+        bool hotkeyPressed = false;
+        if (g_Settings.hotkeyVk != 0) {
+            bool k = (GetAsyncKeyState(g_Settings.hotkeyVk) & 0x8000) != 0;
+            bool c = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool a = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+            bool s = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
             
-            if (g_IsSimulatingInput.load()) {
-                Log("Ignored simulated hotkey press");
-            } else if (g_EnableInputPassthrough.load() && g_WasEnabledViaUI.load()) {
-                Log("Hotkey pressed after UI enable - Ignoring action to sync state");
-                g_WasEnabledViaUI = false;
-            } else {
-                bool newState = !g_EnableInputPassthrough.load();
-                g_EnableInputPassthrough = newState;
-                if (newState) {
-                    g_WasEnabledViaUI = false;
-                }
-
-                Log("Hotkey pressed - Input passthrough %s", newState ? "ENABLED" : "DISABLED");
-
-                if (g_EnableAutoClickAndRepress.load()) {
-                     int vk = g_HotkeyVirtualKey.load();
-                     bool ctrl = g_HotkeyCtrl.load();
-                     bool alt = g_HotkeyAlt.load();
-                     bool shift = g_HotkeyShift.load();
-
-                     if (newState) {
-                         // Case: OFF -> ON
-                         // "clicca in automatico sull'overlay e subito dopo ripreme in automatico il tasto scelto"
-                         std::thread([vk, ctrl, alt, shift]() {
-                             g_IsSimulatingInput = true;
-                             std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                             
-                             SimulateMouseClick();
-                             
-                             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-                             SimulateKeyPress(vk, ctrl, alt, shift);
-                             
-                             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                             g_IsSimulatingInput = false;
-                         }).detach();
-                     } else {
-                         // Case: ON -> OFF
-                         // "ripreme in automatico il tasto scelto e subito dopo clicca in automatico sull'overlay"
-                         std::thread([vk, ctrl, alt, shift]() {
-                             g_IsSimulatingInput = true;
-
-                             std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                             g_IsSimulatingInput = false;
-
-                             std::this_thread::sleep_for(std::chrono::milliseconds(250));
-
-                             SimulateMouseClick();
-                             
-                         }).detach();
-                     }
-                }
+            if (k && 
+                c == g_Settings.hotkeyCtrl.load() && 
+                a == g_Settings.hotkeyAlt.load() && 
+                s == g_Settings.hotkeyShift.load()) {
+                hotkeyPressed = true;
             }
         }
-        g_LastHotkeyState = hotkeyPressed;
 
-        // Check if passthrough state changed
-        bool currentPassthroughState = g_EnableInputPassthrough.load();
-        if (currentPassthroughState != previousPassthroughState) {
-            if (!currentPassthroughState) {
-                // Passthrough was just disabled - restore original window styles
-                Log("Passthrough disabled - restoring original window styles");
-                RestoreAllWindowStyles();
-            } else {
-                // Passthrough was just enabled
-                Log("Passthrough enabled - will apply window modifications");
+        // 2. Handle Toggle
+        if (hotkeyPressed && !lastHotkeyState && !g_Settings.isSimulating) {
+            bool newState = !g_Settings.inputPassthrough;
+            g_Settings.inputPassthrough = newState;
+            Log("Passthrough toggled: %s", newState ? "ON" : "OFF");
+
+            if (!newState) {
+                WindowManager::RestoreAll();
             }
-            previousPassthroughState = currentPassthroughState;
+
+            // Auto Click & Repress Logic
+            if (g_Settings.autoClickRepress) {
+                std::thread([newState]() {
+                    g_Settings.isSimulating = true;
+                    int vk = g_Settings.hotkeyVk;
+                    bool c = g_Settings.hotkeyCtrl;
+                    bool a = g_Settings.hotkeyAlt;
+                    bool s = g_Settings.hotkeyShift;
+
+                    if (newState) { // ON
+                        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                        InputSim::Click();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                        InputSim::PressCombo(vk, c, a, s);
+                    } else { // OFF
+                        std::this_thread::sleep_for(std::chrono::milliseconds(450));
+                        InputSim::Click();
+                    }
+                    
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    g_Settings.isSimulating = false;
+                }).detach();
+            }
         }
+        lastHotkeyState = hotkeyPressed;
 
-        if (g_EnableInputPassthrough) {
-            // Passthrough is enabled - do the work
-            EnumWindows(EnumWindowsProc, 0);
+        // 3. Active Loop
+        if (g_Settings.inputPassthrough) {
+            // Enumerate and process windows
+            EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
+                DWORD pid;
+                GetWindowThreadProcessId(hwnd, &pid);
+                if (pid == GetCurrentProcessId() && IsWindowVisible(hwnd)) {
+                    WindowManager::ProcessWindow(hwnd);
+                    EnumChildWindows(hwnd, [](HWND c, LPARAM) -> BOOL {
+                        WindowManager::ProcessWindow(c);
+                        return TRUE;
+                    }, 0);
+                }
+                return TRUE;
+            }, 0);
 
-            // Periodically clean up dead windows from our maps (every 100 iterations = ~1 second)
+            // Cleanup occasionally
             if (++cleanupCounter >= 100) {
+                WindowManager::CleanupDeadWindows();
                 cleanupCounter = 0;
-                {
-                    std::lock_guard<std::mutex> lock(g_SubclassMutex);
-                    auto it = g_SubclassedWindows.begin();
-                    while (it != g_SubclassedWindows.end()) {
-                        if (!IsWindow(it->first)) {
-                            Log("Removing dead window %p from subclass map", it->first);
-                            it = g_SubclassedWindows.erase(it);
-                        } else {
-                            ++it;
-                        }
-                    }
-                }
-                {
-                    std::lock_guard<std::mutex> lock(g_StylesMutex);
-                    auto it = g_OriginalStyles.begin();
-                    while (it != g_OriginalStyles.end()) {
-                        if (!IsWindow(it->first)) {
-                            Log("Removing dead window %p from styles map", it->first);
-                            it = g_OriginalStyles.erase(it);
-                        } else {
-                            ++it;
-                        }
-                    }
-                }
             }
 
-            // Force cursor visibility
-            CURSORINFO ci = { sizeof(CURSORINFO) };
-            if (GetCursorInfo(&ci)) {
-                if (!(ci.flags & CURSOR_SHOWING)) {
-                    while (ShowCursor(TRUE) < 0);
-                }
-            }
-
-            // Force cursor shape
-            SetCursor(LoadCursor(NULL, IDC_ARROW));
-
-            // Unconditionally unclip cursor to fix alignment issues
+            // Force cursor
             ClipCursor(NULL);
-
+            
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         } else {
-            // Passthrough is disabled - sleep longer to save CPU
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
-    Log("InputBlocker thread exiting");
+    Log("Worker thread stopped");
 }
 
-extern "C" __declspec(dllexport) void AddonInitialize(IHost* host, ImGuiContext* ctx, void* alloc_func, void* free_func, void* user_data) {
-    // Get the path of this DLL
-    HMODULE hModule = NULL;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        (LPCWSTR)&AddonInitialize, &hModule);
+// --- Exports ---
 
+extern "C" __declspec(dllexport) void AddonInitialize(IHost* host, ImGuiContext* ctx, void* alloc_func, void* free_func, void* user_data) {
+    // Init Logger
+    HMODULE hModule = NULL;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&AddonInitialize, &hModule);
     wchar_t path[MAX_PATH];
     GetModuleFileNameW(hModule, path, MAX_PATH);
-
-    // Remove filename to get directory
     wchar_t* lastSlash = wcsrchr(path, L'\\');
-    if (lastSlash) {
-        *(lastSlash + 1) = L'\0';
-    }
-
-    std::wstring logPath = std::wstring(path) + L"LS_ReShade.log";
-    Logger::Init(logPath);
-
-    Log("======== AddonInitialize called ========");
-    Log("Log file path: %S", logPath.c_str());
-
-    // Store ImGui context
+    if (lastSlash) *(lastSlash + 1) = L'\0';
+    Logger::Init(std::wstring(path) + L"LS_ReShade.log");
+    
+    Log("Addon Initialized");
     g_ImGuiContext = ctx;
 
-    // Check if thread needs to be started
+    // Start Thread
     static bool threadStarted = false;
     if (!threadStarted) {
-        Log("Starting persistent worker thread...");
-        g_Thread = std::thread(InputBlockerLoop);
-        g_Thread.detach();
+        std::thread(WorkerThread).detach();
         threadStarted = true;
-        Log("Thread started");
-    } else {
-        Log("AddonInitialize called again, thread already running");
     }
-
-    Log("Addon initialization complete");
 }
 
 extern "C" __declspec(dllexport) void AddonShutdown() {
-    Log("AddonShutdown called - stopping thread");
-
-    // Signal thread to exit
-    g_ThreadShouldExit = true;
-
-    // Wait a bit for thread to exit
+    g_Settings.threadRunning = false;
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    // Restore all WNDPROCs
-    {
-        std::lock_guard<std::mutex> lock(g_SubclassMutex);
-        Log("Restoring %zu subclassed windows", g_SubclassedWindows.size());
-        for (auto const& [hwnd, oldProc] : g_SubclassedWindows) {
-            if (IsWindow(hwnd)) {
-                WNDPROC current = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_WNDPROC);
-                if (current == NewWndProc) {
-                    SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)oldProc);
-                    Log("Restored WndProc for window: %p", hwnd);
-                }
-            }
-        }
-        g_SubclassedWindows.clear();
-    }
-
-    Log("Addon shutdown complete");
+    WindowManager::RestoreAll();
     Logger::Close();
-}
-
-const char* GetKeyName(int vk) {
-    static char buffer[32];
-    switch (vk) {
-        case 0: return "None";
-        case VK_F1: return "F1";
-        case VK_F2: return "F2";
-        case VK_F3: return "F3";
-        case VK_F4: return "F4";
-        case VK_F5: return "F5";
-        case VK_F6: return "F6";
-        case VK_F7: return "F7";
-        case VK_F8: return "F8";
-        case VK_F9: return "F9";
-        case VK_F10: return "F10";
-        case VK_F11: return "F11";
-        case VK_F12: return "F12";
-        case VK_INSERT: return "Insert";
-        case VK_DELETE: return "Delete";
-        case VK_HOME: return "Home";
-        case VK_END: return "End";
-        case VK_PRIOR: return "Page Up";
-        case VK_NEXT: return "Page Down";
-        default:
-            if (vk >= 'A' && vk <= 'Z') {
-                sprintf_s(buffer, "%c", vk);
-                return buffer;
-            }
-            sprintf_s(buffer, "Key %d", vk);
-            return buffer;
-    }
-}
-
-extern "C" __declspec(dllexport) void AddonRenderSettings() {
-    if (!g_ImGuiContext) return;
-
-    ImGui::SetCurrentContext(g_ImGuiContext);
-
-    ImGui::TextWrapped("Input Blocker allows you to interact with the Lossless Scaling overlay instead of the game behind it.");
-    ImGui::Separator();
-
-    bool enabled = g_EnableInputPassthrough.load();
-    if (ImGui::Checkbox("Enable Input Passthrough to Overlay", &enabled)) {
-        g_EnableInputPassthrough = enabled;
-        if (enabled) {
-            g_WasEnabledViaUI = true;
-        } else {
-            g_WasEnabledViaUI = false;
-        }
-        Log("Input passthrough %s via settings UI", enabled ? "ENABLED" : "DISABLED");
-    }
-
-    bool autoClick = g_EnableAutoClickAndRepress.load();
-    if (ImGui::Checkbox("Enable Auto Click & Repress (ReShade Fix)", &autoClick)) {
-        g_EnableAutoClickAndRepress = autoClick;
-        Log("Auto Click & Repress: %s", autoClick ? "ENABLED" : "DISABLED");
-    }
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::TextWrapped("Hotkey Configuration:");
-
-    // Modifiers
-    bool ctrl = g_HotkeyCtrl.load();
-    bool alt = g_HotkeyAlt.load();
-    bool shift = g_HotkeyShift.load();
-
-    if (ImGui::Checkbox("Ctrl", &ctrl)) {
-        g_HotkeyCtrl = ctrl;
-        Log("Hotkey modifier Ctrl: %s", ctrl ? "ON" : "OFF");
-    }
-    ImGui::SameLine();
-    if (ImGui::Checkbox("Alt", &alt)) {
-        g_HotkeyAlt = alt;
-        Log("Hotkey modifier Alt: %s", alt ? "ON" : "OFF");
-    }
-    ImGui::SameLine();
-    if (ImGui::Checkbox("Shift", &shift)) {
-        g_HotkeyShift = shift;
-        Log("Hotkey modifier Shift: %s", shift ? "ON" : "OFF");
-    }
-
-    // Key selection
-    int currentKey = g_HotkeyVirtualKey.load();
-    const char* currentKeyName = GetKeyName(currentKey);
-
-    if (ImGui::BeginCombo("Key", currentKeyName)) {
-        const int keys[] = {
-            0, // None
-            VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6,
-            VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
-            VK_INSERT, VK_DELETE, VK_HOME, VK_END,
-            VK_PRIOR, VK_NEXT,
-            'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
-            'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'
-        };
-
-        for (int vk : keys) {
-            const char* keyName = GetKeyName(vk);
-            bool isSelected = (currentKey == vk);
-            if (ImGui::Selectable(keyName, isSelected)) {
-                g_HotkeyVirtualKey = vk;
-                Log("Hotkey key changed to: %s", keyName);
-            }
-            if (isSelected) {
-                ImGui::SetItemDefaultFocus();
-            }
-        }
-        ImGui::EndCombo();
-    }
-
-    // Display current hotkey
-    ImGui::Spacing();
-    char hotkeyDisplay[128];
-    if (currentKey == 0) {
-        sprintf_s(hotkeyDisplay, "Current Hotkey: None (toggle disabled)");
-    } else {
-        sprintf_s(hotkeyDisplay, "Current Hotkey: %s%s%s%s",
-            ctrl ? "Ctrl + " : "",
-            alt ? "Alt + " : "",
-            shift ? "Shift + " : "",
-            currentKeyName);
-    }
-    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", hotkeyDisplay);
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::TextWrapped("\nWhen enabled:\n- Mouse and keyboard input goes to the LS overlay\n- Cursor is visible and free\n- You can interact with overlay UI");
-    ImGui::TextWrapped("\nWhen disabled:\n- Input goes to the game behind the overlay\n- Normal Lossless Scaling behavior");
 }
 
 extern "C" __declspec(dllexport) uint32_t GetAddonCapabilities() {
@@ -708,9 +354,62 @@ extern "C" __declspec(dllexport) uint32_t GetAddonCapabilities() {
 }
 
 extern "C" __declspec(dllexport) const char* GetAddonName() {
-    return "Input Blocker";
+    return "Input Blocker (Optimized)";
 }
 
 extern "C" __declspec(dllexport) const char* GetAddonVersion() {
-    return "0.1.0";
+    return "0.2.0";
+}
+
+// --- UI Helper ---
+const char* GetKeyName(int vk) {
+    static char buffer[32];
+    if (vk == 0) return "None";
+    if (vk >= VK_F1 && vk <= VK_F12) { sprintf_s(buffer, "F%d", vk - VK_F1 + 1); return buffer; }
+    switch (vk) {
+        case VK_INSERT: return "Insert"; case VK_DELETE: return "Delete";
+        case VK_HOME: return "Home"; case VK_END: return "End";
+        case VK_PRIOR: return "Page Up"; case VK_NEXT: return "Page Down";
+    }
+    if (vk >= 'A' && vk <= 'Z') { sprintf_s(buffer, "%c", vk); return buffer; }
+    sprintf_s(buffer, "Key %d", vk);
+    return buffer;
+}
+
+extern "C" __declspec(dllexport) void AddonRenderSettings() {
+    if (!g_ImGuiContext) return;
+    ImGui::SetCurrentContext(g_ImGuiContext);
+
+    ImGui::TextWrapped("Input Blocker allows interaction with the overlay.");
+    ImGui::Separator();
+
+    bool enabled = g_Settings.inputPassthrough;
+    if (ImGui::Checkbox("Enable Input Passthrough", &enabled)) {
+        g_Settings.inputPassthrough = enabled;
+        if (!enabled) WindowManager::RestoreAll();
+    }
+
+    bool autoClick = g_Settings.autoClickRepress;
+    if (ImGui::Checkbox("Enable Auto Click & Repress", &autoClick)) g_Settings.autoClickRepress = autoClick;
+
+    ImGui::Separator();
+    ImGui::Text("Hotkey:");
+    
+    bool c = g_Settings.hotkeyCtrl;
+    bool a = g_Settings.hotkeyAlt;
+    bool s = g_Settings.hotkeyShift;
+    if (ImGui::Checkbox("Ctrl", &c)) g_Settings.hotkeyCtrl = c;
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Alt", &a)) g_Settings.hotkeyAlt = a;
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Shift", &s)) g_Settings.hotkeyShift = s;
+
+    int currentKey = g_Settings.hotkeyVk;
+    if (ImGui::BeginCombo("Key", GetKeyName(currentKey))) {
+        const int keys[] = { 0, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z' };
+        for (int vk : keys) {
+            if (ImGui::Selectable(GetKeyName(vk), currentKey == vk)) g_Settings.hotkeyVk = vk;
+        }
+        ImGui::EndCombo();
+    }
 }
